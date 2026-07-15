@@ -11,6 +11,8 @@ Swap models by changing MODEL below.
 """
 
 import os
+import re
+import string
 from collections import Counter
 
 import anthropic
@@ -44,27 +46,38 @@ def generate_paraphrases(question: str) -> list[str]:
 
 
 def get_answer(question: str) -> str:
-    """Return the model's answer to `question`."""
+    """Return the model's answer to `question`, constrained to a direct answer."""
     response = client.messages.create(
         model=MODEL,
         max_tokens=64,
+        system=(
+            "Answer with only the direct answer — a single word or short "
+            "phrase. No full sentences, no punctuation, no explanation."
+        ),
         messages=[{"role": "user", "content": question}],
     )
     return next(b.text for b in response.content if b.type == "text").strip()
 
 
+def normalize(answer: str) -> str:
+    """Lowercase, strip punctuation and collapse whitespace for comparison."""
+    text = answer.lower().translate(str.maketrans("", "", string.punctuation))
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def main():
     questions = [QUESTION] + generate_paraphrases(QUESTION)
     answers = [get_answer(q) for q in questions]
+    normalized = [normalize(a) for a in answers]
 
-    counts = Counter(answers)
+    counts = Counter(normalized)
     majority_answer, majority_count = counts.most_common(1)[0]
     consistency = majority_count / len(answers)
 
     print(f"Question: {QUESTION}\n")
     print("Answers across original + 5 paraphrases:")
-    for q, a in zip(questions, answers):
-        flag = "" if a == majority_answer else "  <-- DEVIATES"
+    for q, a, n in zip(questions, answers, normalized):
+        flag = "" if n == majority_answer else "  <-- DEVIATES"
         print(f"  [{a}]\n    {q}{flag}")
 
     print(f"\nMajority answer: {majority_answer!r} ({majority_count}/{len(answers)})")
