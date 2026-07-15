@@ -40,7 +40,22 @@ sys.stdout.reconfigure(encoding="utf-8")
 
 load_dotenv()  # loads ANTHROPIC_API_KEY from .env into the environment
 
-MODEL = "claude-haiku-4-5"
+MODEL = "claude-haiku-4-5"           # the model under test (answers the questions)
+VERIFIER_MODEL = "claude-sonnet-4-5"  # stronger model for paraphrasing + judging,
+                                      # so the judge isn't grading its own work.
+                                      # Accepts temperature=0 (unlike Sonnet 5),
+                                      # so the verifier layer is deterministic too.
+
+TEMPERATURE = 0  # deterministic sampling for reproducibility. Applied on every
+                 # call whose model accepts it. NOTE: newer models (Sonnet 5,
+                 # Opus 4.7/4.8, Fable 5) reject an explicit temperature with a
+                 # 400, so it is omitted for those — the verifier calls on
+                 # VERIFIER_MODEL therefore still run at the model default and
+                 # are not fully deterministic.
+_NO_SAMPLING_MODELS = {
+    "claude-sonnet-5", "claude-opus-4-8", "claude-opus-4-7", "claude-fable-5",
+    "claude-mythos-5",
+}
 
 QUESTION = "What is the capital of France?"
 
@@ -57,35 +72,100 @@ TAXONOMY = {
 }
 
 # How each category's level is phrased inside the paraphrase prompt. `{level}`
-# is substituted with the specific level being applied.
+# is substituted with the specific level being applied. GRAMMAR is handled
+# separately (see GRAMMAR_INSTRUCTIONS) because it needs explicit per-level
+# syntax rules rather than one template.
 CATEGORY_INSTRUCTIONS = {
     "VOCABULARY": "using {level} vocabulary (adjust word difficulty only)",
     "TONE": "in a {level} tone",
-    "GRAMMAR": "using {level} sentence structure",
     "LANGUAGE": "translated into {level}",
+}
+
+# GRAMMAR needs explicit per-level syntax instructions: a vague "use compound
+# sentence structure" makes the model bolt on a *second* question instead of
+# restructuring the one it was given. Each entry is (instruction, example); the
+# examples all restructure the SAME sample question ("What is the largest ocean
+# on Earth?", answer "the Pacific") so the model sees the syntax change while
+# the question asked stays identical.
+GRAMMAR_INSTRUCTIONS = {
+    "simple": (
+        "Rewrite it as a single independent clause (one simple sentence).",
+        'Example: "What is the largest ocean on Earth?"',
+    ),
+    "compound": (
+        "Rewrite it as two coordinated clauses joined by and/but/or that "
+        "together still ask for the same single answer. The added clause must "
+        "not ask for anything new — it only sets up the one question.",
+        'Example: "Earth has a largest ocean, but what is it?"',
+    ),
+    "complex": (
+        "Rewrite it as a main clause plus a subordinate (dependent) clause.",
+        'Example: "What is the largest ocean that covers the Earth?"',
+    ),
+    "passive voice": (
+        "Rewrite it using a passive construction.",
+        "Example: \"By what name is Earth's largest ocean known?\"",
+    ),
+    "inverted": (
+        "Rewrite it using inverted (non-standard) word order.",
+        'Example: "The largest ocean on Earth is which one?"',
+    ),
 }
 
 client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
 
 # --- LLM helpers -------------------------------------------------------------
-def _ask(prompt: str, *, system: str | None = None, max_tokens: int = 256) -> str:
-    kwargs = {"model": MODEL, "max_tokens": max_tokens,
+def _ask(prompt: str, *, model: str, system: str | None = None,
+         max_tokens: int = 256, thinking: dict | None = None) -> str:
+    kwargs = {"model": model, "max_tokens": max_tokens,
               "messages": [{"role": "user", "content": prompt}]}
     if system is not None:
         kwargs["system"] = system
+    if thinking is not None:
+        kwargs["thinking"] = thinking
+    if model not in _NO_SAMPLING_MODELS:
+        kwargs["temperature"] = TEMPERATURE  # omitted where the model rejects it
     response = client.messages.create(**kwargs)
-    return next(b.text for b in response.content if b.type == "text").strip()
+    # Guard against an empty response (e.g. a thinking model that spent its
+    # whole budget before emitting text) so the failure is legible.
+    text = next((b.text for b in response.content if b.type == "text"), "")
+    return text.strip()
 
 
-def _yes(prompt: str) -> bool:
+# Verifier calls (paraphrasing, validation, judging) run on VERIFIER_MODEL with
+# thinking off: the tasks are short and structured, and leaving adaptive
+# thinking on can consume a small max_tokens budget before any text is emitted.
+_NO_THINKING = {"type": "disabled"}
+
+
+def _yes(prompt: str, *, model: str) -> bool:
     """Ask a yes/no question and return True iff the model says yes."""
-    return _ask(prompt, system="Answer with only YES or NO.", max_tokens=5).lower().startswith("yes")
+    return _ask(prompt, model=model, system="Answer with only YES or NO.",
+                max_tokens=10, thinking=_NO_THINKING).lower().startswith("yes")
 
 
 # --- Paraphrase generation + validation (input side) -------------------------
 def generate_paraphrases(question: str, category: str, level: str) -> str:
     """Generate one paraphrase applying a single category+level variation."""
+    if category == "GRAMMAR":
+        instruction, example = GRAMMAR_INSTRUCTIONS[level]
+        prompt = (
+            f"Rewrite the question below by changing ONLY its grammatical "
+            f"structure to this form:\n"
+            f"{instruction}\n"
+            f"{example}\n\n"
+            f"HARD CONSTRAINT: the result must remain EXACTLY ONE question "
+            f"asking for EXACTLY the same single piece of information. "
+            f"Restructure the syntax only — do NOT introduce a second question "
+            f"or any clause that asks for something new, and do not change what "
+            f"is being asked.\n"
+            f"Return only the rewritten question, with no quotes, labels, or "
+            f"explanation.\n\n"
+            f"Question: {question}"
+        )
+        return _ask(prompt, model=VERIFIER_MODEL, thinking=_NO_THINKING)
+
     instruction = CATEGORY_INSTRUCTIONS[category].format(level=level)
     prompt = (
         f"Rewrite the question below {instruction}.\n"
@@ -96,7 +176,7 @@ def generate_paraphrases(question: str, category: str, level: str) -> str:
         f"explanation.\n\n"
         f"Question: {question}"
     )
-    return _ask(prompt)
+    return _ask(prompt, model=VERIFIER_MODEL, thinking=_NO_THINKING)
 
 
 def validate_paraphrase(original: str, paraphrase: str) -> bool:
@@ -115,7 +195,7 @@ def validate_paraphrase(original: str, paraphrase: str) -> bool:
         f"language, vocabulary, tone, or grammar is acceptable as long as the "
         f"meaning is identical. Answer YES or NO."
     )
-    return _yes(prompt)
+    return _yes(prompt, model=VERIFIER_MODEL)
 
 
 def make_validated_paraphrase(question, category, level):
@@ -143,6 +223,7 @@ def get_answer(question: str) -> str:
     """
     return _ask(
         question,
+        model=MODEL,
         system=(
             "Answer with only the direct answer — a single word or short "
             "phrase. Always answer in English. No full sentences, no "
@@ -162,7 +243,7 @@ def answers_equivalent(answer_a: str, answer_b: str) -> bool:
         f"wording, language, spelling, capitalization, or extra detail — judge "
         f"only whether they mean the same thing. Answer YES or NO."
     )
-    return _yes(prompt)
+    return _yes(prompt, model=VERIFIER_MODEL)
 
 
 def normalize(answer: str) -> str:
@@ -232,8 +313,11 @@ def main():
 
     # --- Summary table -------------------------------------------------------
     print("\n" + "=" * 104)
-    print(f"Question: {QUESTION}")
-    print(f"Model:    {MODEL}")
+    print(f"Question:         {QUESTION}")
+    print(f"Model under test: {MODEL}  (temperature={TEMPERATURE})")
+    temp_note = (f"temperature={TEMPERATURE}" if VERIFIER_MODEL not in _NO_SAMPLING_MODELS
+                 else "temperature not settable — model default")
+    print(f"Verifier model:   {VERIFIER_MODEL}  ({temp_note}; paraphrasing + validation + judge)")
     print("=" * 104)
     print(f"{'CATEGORY':<10} {'LEVEL':<18} {'PARAPHRASE':<38} {'ANSWER':<12} "
           f"{'VALID':<6} DEVIATION")
